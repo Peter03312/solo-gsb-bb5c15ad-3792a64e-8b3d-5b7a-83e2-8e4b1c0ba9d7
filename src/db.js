@@ -10,7 +10,24 @@ export function openDb(path) {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+// 既有数据库的就地迁移：为 runs 表补齐校准冻结列（新增列允许 NULL，
+// 历史运行行保持 NULL——表示其开始时设备尚无校准记录，历史不改写）。
+function migrate(db) {
+  const cols = new Set(
+    db.prepare('PRAGMA table_info(runs)').all().map((c) => c.name),
+  );
+  const add = (name, ddl) => {
+    if (!cols.has(name)) db.prepare(`ALTER TABLE runs ADD COLUMN ${ddl}`).run();
+  };
+  add('frozen_calibration_id', 'frozen_calibration_id INTEGER');
+  add('frozen_calib_no', 'frozen_calib_no TEXT');
+  add('frozen_calibrated_at', 'frozen_calibrated_at TEXT');
+  add('frozen_expires_at', 'frozen_expires_at TEXT');
+  add('frozen_calibration_result', 'frozen_calibration_result TEXT');
 }
 
 export const SCHEMA = `
@@ -163,6 +180,13 @@ CREATE TABLE IF NOT EXISTS runs (
   frozen_reservation_start_utc TEXT NOT NULL,
   frozen_reservation_end_utc TEXT NOT NULL,
   frozen_reservation_usage_json TEXT NOT NULL,
+  -- 冻结的校准依据（开始时写入，之后永不改写）；
+  -- 设备开始运行时无校准记录则整组为 NULL（无记录设备沿用原开始规则）
+  frozen_calibration_id INTEGER,
+  frozen_calib_no TEXT,
+  frozen_calibrated_at TEXT,
+  frozen_expires_at TEXT,
+  frozen_calibration_result TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (verification_id) REFERENCES verifications(id),
   FOREIGN KEY (reservation_id) REFERENCES reservations(id),
@@ -191,6 +215,20 @@ CREATE TABLE IF NOT EXISTS maintenances (
   maint_no TEXT NOT NULL UNIQUE,
   device_no TEXT NOT NULL,
   reason TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 设备校准记录：calib_no 为幂等键（同号同内容重复提交返回原记录，异内容拒绝）。
+-- 记录只追加：同设备校准时间须晚于上一条，按最新一条（calibrated_at 最大）判定放行。
+-- calibrated_at/expires_at 为 UTC ISO 字符串（毫秒精度）；
+-- created_at 为服务端登记时刻（与校准时间彼此独立）。
+CREATE TABLE IF NOT EXISTS calibrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calib_no TEXT NOT NULL UNIQUE,
+  device_no TEXT NOT NULL,
+  calibrated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  result TEXT NOT NULL CHECK (result IN ('pass', 'fail')),
   created_at TEXT NOT NULL
 );
 `;
@@ -548,8 +586,10 @@ export function insertRun(db, b) {
          frozen_verification_passed, frozen_verification_diff_sum,
          frozen_verification_mass_sum, frozen_verification_checks_json,
          frozen_reservation_start_utc, frozen_reservation_end_utc,
-         frozen_reservation_usage_json
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         frozen_reservation_usage_json,
+         frozen_calibration_id, frozen_calib_no, frozen_calibrated_at,
+         frozen_expires_at, frozen_calibration_result
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       b.runNo,
@@ -571,6 +611,11 @@ export function insertRun(db, b) {
       b.reservationStartUtc,
       b.reservationEndUtc,
       JSON.stringify(b.reservationUsage ?? []),
+      b.calibrationId ?? null,
+      b.calibNo ?? null,
+      b.calibratedAtUtc ?? null,
+      b.expiresAtUtc ?? null,
+      b.calibrationResult ?? null,
     );
   return getRunRow(db, info.lastInsertRowid);
 }
@@ -661,4 +706,55 @@ export function insertMaintenance(db, { maintNo, deviceNo, reason, createdAt }) 
     )
     .run(maintNo, deviceNo, reason, createdAt);
   return getMaintenanceRow(db, info.lastInsertRowid);
+}
+
+// ---------- 设备校准（只追加，由 server 在单事务内调用） ----------
+
+export function getCalibrationRow(db, id) {
+  return db.prepare('SELECT * FROM calibrations WHERE id = ?').get(id);
+}
+
+export function getCalibrationRowByNo(db, calibNo) {
+  return db.prepare('SELECT * FROM calibrations WHERE calib_no = ?').get(calibNo);
+}
+
+export function listCalibrationRows(db) {
+  return db
+    .prepare('SELECT * FROM calibrations ORDER BY id DESC')
+    .all();
+}
+
+export function listCalibrationRowsByDevice(db, deviceNo) {
+  return db
+    .prepare(
+      'SELECT * FROM calibrations WHERE device_no = ? ORDER BY calibrated_at, id',
+    )
+    .all(deviceNo);
+}
+
+// 设备最新一条校准记录（放行判定依据）；无记录时返回 undefined。
+// 同设备校准时间单调递增（登记时强制），calibrated_at 最大者即最新一条。
+export function getLatestCalibrationRow(db, deviceNo) {
+  return db
+    .prepare(
+      `SELECT * FROM calibrations
+        WHERE device_no = ?
+        ORDER BY calibrated_at DESC, id DESC LIMIT 1`,
+    )
+    .get(deviceNo);
+}
+
+// 登记校准：createdAt 由服务端以毫秒精度 ISO 写入（登记时刻）。
+export function insertCalibration(
+  db,
+  { calibNo, deviceNo, calibratedAtUtc, expiresAtUtc, result, createdAt },
+) {
+  const info = db
+    .prepare(
+      `INSERT INTO calibrations
+         (calib_no, device_no, calibrated_at, expires_at, result, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(calibNo, deviceNo, calibratedAtUtc, expiresAtUtc, result, createdAt);
+  return getCalibrationRow(db, info.lastInsertRowid);
 }

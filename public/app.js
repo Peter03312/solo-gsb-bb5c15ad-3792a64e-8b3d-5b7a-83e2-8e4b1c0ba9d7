@@ -95,6 +95,7 @@ function renderAll() {
   renderRuns();
   renderDevices();
   renderMaintenances();
+  renderCalibrations();
 }
 
 function renderHoleMax(d) {
@@ -1342,6 +1343,17 @@ async function openRun(id) {
     <p class="muted mono">预约 #${fb.reservation.id}：[${fb.reservation.startUtc}, ${
       fb.reservation.endUtc})（左闭右开）<br>
       冻结占用规格：${escapeHtml(usageText(fb.reservation.usage))}</p>
+    <h3>冻结的校准依据</h3>
+    ${
+      fb.calibration
+        ? `<p class="muted mono">校准 #${fb.calibration.id}（单号 ${escapeHtml(fb.calibration.calibNo)}）：
+             <span class="${fb.calibration.result === 'pass' ? 'tag-ok' : 'tag-bad'}">${
+             fb.calibration.result === 'pass' ? '✓ 合格' : '✗ 不合格'
+           }</span><br>
+             校准时间 ${fb.calibration.calibratedAtUtc} · 有效期至 ${fb.calibration.expiresAtUtc}</p>
+           <p class="muted">开始运行后新增的校准记录不改写此冻结依据。</p>`
+        : '<p class="muted">开始运行时该设备无校准记录，按原规则放行（未冻结校准依据）。</p>'
+    }
     <details class="snapshot-block">
       <summary>冻结的发布图配置快照</summary>
       <pre>${escapeHtml(JSON.stringify(fb.publication.config, null, 2))}</pre>
@@ -1380,7 +1392,7 @@ function renderDevices() {
   box.innerHTML = `<div class="table-wrap"><table class="res-table">
     <thead><tr>
       <th>设备编号</th><th>当前状态</th><th>保养上限</th><th>本周期已用（已完结）</th>
-      <th>剩余额度</th><th>待保养</th><th>最近保养（UTC）</th>
+      <th>剩余额度</th><th>待保养</th><th>最近保养（UTC）</th><th>最新校准（放行判定依据）</th>
     </tr></thead><tbody>${devs
       .map(
         (d) => `<tr${d.maintenanceDue ? ' class="row-bad"' : ''}>
@@ -1405,6 +1417,13 @@ function renderDevices() {
             : '<span class="tag-ok">✓ 未到期</span>'
       }</td>
       <td class="mono">${d.lastMaintenanceAt || '<span class="muted">从未保养</span>'}</td>
+      <td>${
+        d.latestCalibration
+          ? `<span class="${d.latestCalibration.result === 'pass' ? 'tag-ok' : 'tag-bad'}">${
+              d.latestCalibration.result === 'pass' ? '✓ 合格' : '✗ 不合格'
+            }</span> <span class="mono muted">${escapeHtml(d.latestCalibration.calibNo)}<br>有效期至 ${d.latestCalibration.expiresAtUtc}</span>`
+          : '<span class="muted">无记录（按原规则放行）</span>'
+      }</td>
     </tr>`,
       )
       .join('')}</tbody></table></div>`;
@@ -1475,6 +1494,81 @@ $('#maint-submit').addEventListener('click', async () => {
   } catch (e) {
     $('#maint-conflict').innerHTML = `<div class="banner bad">
       <b>保养未能登记（未留记录）：</b>
+      <ul>${(e.data && e.data.errors ? e.data.errors : [e.message])
+        .map((x) => `<li>${escapeHtml(x)}</li>`)
+        .join('')}</ul>
+    </div>`;
+    showAlert(e.message, 'err');
+  }
+});
+
+// ---------- 设备校准 ----------
+
+const CALIB_RESULT_LABEL = { pass: '✓ 合格', fail: '✗ 不合格' };
+
+function renderCalibrations() {
+  const box = $('#cal-list');
+  const list = state.calibrations || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">暂无校准记录（无记录设备按原规则放行运行）。</div>';
+    return;
+  }
+  // 各设备最新一条（列表按登记倒序，首个出现的即最新）
+  const latestByDevice = new Map();
+  for (const c of list) {
+    if (
+      !latestByDevice.has(c.deviceNo) ||
+      c.calibratedAtUtc > latestByDevice.get(c.deviceNo).calibratedAtUtc
+    ) {
+      latestByDevice.set(c.deviceNo, c);
+    }
+  }
+  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+    <thead><tr>
+      <th>校准单号</th><th>设备编号</th><th>结论</th>
+      <th>校准时间（UTC）</th><th>到期时间（UTC）</th><th>登记时间（UTC）</th><th>判定依据</th>
+    </tr></thead><tbody>${list
+      .map((c) => {
+        const isLatest = latestByDevice.get(c.deviceNo) === c;
+        return `<tr${c.result === 'fail' ? ' class="row-bad"' : ''}>
+      <td><b>${escapeHtml(c.calibNo)}</b></td>
+      <td>${escapeHtml(c.deviceNo)}</td>
+      <td><span class="${c.result === 'pass' ? 'tag-ok' : 'tag-bad'}">${
+        CALIB_RESULT_LABEL[c.result] || c.result
+      }</span></td>
+      <td class="mono">${c.calibratedAtUtc}</td>
+      <td class="mono">${c.expiresAtUtc}</td>
+      <td class="mono">${c.createdAt}</td>
+      <td>${
+        isLatest
+          ? '<span class="badge ok">该设备最新一条（放行判定依据）</span>'
+          : '<span class="muted">历史记录</span>'
+      }</td>
+    </tr>`;
+      })
+      .join('')}</tbody></table></div>`;
+}
+
+$('#cal-submit').addEventListener('click', async () => {
+  const body = {
+    calibNo: $('#cal-no').value.trim(),
+    deviceNo: $('#cal-device').value.trim(),
+    result: $('#cal-result').value,
+    calibratedAtUtc: $('#cal-time').value || '',
+    expiresAtUtc: $('#cal-expire').value || '',
+  };
+  $('#cal-conflict').innerHTML = '';
+  try {
+    const c = await api('POST', '/api/calibrations', body);
+    $('#cal-no').value = '';
+    await refresh(
+      `校准「${c.calibNo}」已登记（设备「${c.deviceNo}」，结论：${
+        c.result === 'pass' ? '合格' : '不合格'
+      }，有效期至 ${c.expiresAtUtc}）。`,
+    );
+  } catch (e) {
+    $('#cal-conflict').innerHTML = `<div class="banner bad">
+      <b>校准未能登记（未留记录）：</b>
       <ul>${(e.data && e.data.errors ? e.data.errors : [e.message])
         .map((x) => `<li>${escapeHtml(x)}</li>`)
         .join('')}</ul>

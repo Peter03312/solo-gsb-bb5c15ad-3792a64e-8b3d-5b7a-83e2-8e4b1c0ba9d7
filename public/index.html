@@ -208,8 +208,10 @@
         以<b>唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号</b>开始一次离心运行；
         开始/结束时间由服务端记录。开始时在事务内确认：核验已通过、核验与生效预约指向
         <b>同一张发布图</b>、发布图<b>当前可用</b>、当前时刻处于预约
-        <b>左闭右开 [开始, 结束)</b> 时段、该预约未被其他运行使用、同设备无进行中运行；
-        任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论与预约时段；完结如实填写
+        <b>左闭右开 [开始, 结束)</b> 时段、该预约未被其他运行使用、同设备无进行中运行、
+        保养额度未达上限（未设上限不核对）、设备最新校准结论合格且有效期覆盖预约终点
+        （无校准记录不核对）；任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论、
+        预约时段与校准依据；完结如实填写
         「完成 / 中止」，超过预约终点完结会标记<b>超时</b>，随即释放设备，不改写预约。
         相同运行编号同内容重复提交返回原记录，异内容拒绝；完结同状态重放返回原结果。
       </div>
@@ -280,6 +282,45 @@
       <h3>保养记录</h3>
       <div id="maint-list"></div>
       <datalist id="known-devices"></datalist>
+    </section>
+
+    <section class="card" id="sec-calib">
+      <h2>13. 设备校准（按校准记录放行运行）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        登记<b>唯一校准单号 + 设备编号 + 校准时间 + 到期时间 + 合格/不合格结论</b>（时间为 UTC）：
+        校准时间须早于到期时间、不得晚于服务端当前时刻，且同设备校准时间须晚于上一条
+        （记录只追加，按最新一条判定）。已有校准记录的设备，开始运行时在原事务内确认
+        <b>最新结论合格</b>且<b>到期时间不早于本次预约终点</b>，否则拒绝并说明
+        「不合格 / 有效期不足」且不留运行；无记录设备沿用原开始规则。开始成功即冻结校准依据，
+        之后新增记录、运行超时或完结均不改写历史。同号同内容重试返回原记录，异内容拒绝。
+      </div>
+      <h3>登记校准</h3>
+      <div class="form-row">
+        <label>校准单号（唯一）
+          <input id="cal-no" type="text" placeholder="如 CAL-2026-001" />
+        </label>
+        <label>设备编号
+          <input id="cal-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>校准结论
+          <select id="cal-result">
+            <option value="pass">合格</option>
+            <option value="fail">不合格</option>
+          </select>
+        </label>
+        <label>校准时间（UTC）
+          <input id="cal-time" type="datetime-local" step="60" />
+        </label>
+        <label>到期时间（UTC）
+          <input id="cal-expire" type="datetime-local" step="60" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="cal-submit" class="primary">登记校准</button>
+      </div>
+      <div id="cal-conflict"></div>
+      <h3>校准记录（只追加，按最新一条判定）</h3>
+      <div id="cal-list"></div>
     </section>
   </main>
 
