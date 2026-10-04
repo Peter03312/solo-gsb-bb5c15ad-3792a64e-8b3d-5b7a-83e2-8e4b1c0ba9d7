@@ -10,6 +10,7 @@ export function openDb(path) {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  ensureRunCalibrationColumns(db);
   return db;
 }
 
@@ -163,6 +164,13 @@ CREATE TABLE IF NOT EXISTS runs (
   frozen_reservation_start_utc TEXT NOT NULL,
   frozen_reservation_end_utc TEXT NOT NULL,
   frozen_reservation_usage_json TEXT NOT NULL,
+  -- 冻结的校准依据（开始时写入，之后永不改写）；
+  -- NULL 表示开始时该设备无校准记录（无记录设备沿用原开始规则）。
+  frozen_calibration_id INTEGER,
+  frozen_calibration_no TEXT,
+  frozen_calibration_passed INTEGER,
+  frozen_calibration_calibrated_at TEXT,
+  frozen_calibration_expires_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (verification_id) REFERENCES verifications(id),
   FOREIGN KEY (reservation_id) REFERENCES reservations(id),
@@ -193,7 +201,48 @@ CREATE TABLE IF NOT EXISTS maintenances (
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- 设备校准记录：calib_no 为幂等键（同号同内容重复提交返回原记录，异内容拒绝）。
+-- 记录只追加（无修改/删除接口）；按设备「最新一条」判定运行能否放行。
+-- 登记时已在单事务内核对：
+--   * 校准时间早于到期时间、校准时间不晚于服务端当前时刻（规整/事务内校验）；
+--   * 同设备校准时间严格晚于上一条（最新一条）校准记录。
+-- 通过后结论与有效期随开始运行冻结（runs.frozen_calibration_*），之后新增记录、
+-- 运行超时或完结都不改写已冻结的校准依据。
+CREATE TABLE IF NOT EXISTS calibrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  calib_no TEXT NOT NULL UNIQUE,
+  device_no TEXT NOT NULL,
+  calibrated_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibrations_device
+  ON calibrations (device_no, calibrated_at, id);
 `;
+
+// 既有库平滑升级：runs 增加开始时冻结的校准依据列（老库无此列时补齐；
+// 历史运行该列为 NULL——冻结时设备无校准记录，与「无记录沿用原规则」一致）。
+const RUN_FROZEN_CALIBRATION_COLUMNS = [
+  'frozen_calibration_id INTEGER',
+  'frozen_calibration_no TEXT',
+  'frozen_calibration_passed INTEGER',
+  'frozen_calibration_calibrated_at TEXT',
+  'frozen_calibration_expires_at TEXT',
+];
+
+// 幂等补列（SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，先查 PRAGMA）。
+function ensureRunCalibrationColumns(db) {
+  const existing = new Set(db.prepare('PRAGMA table_info(runs)').all().map((c) => c.name));
+  for (const ddl of RUN_FROZEN_CALIBRATION_COLUMNS) {
+    const name = ddl.split(' ')[0];
+    if (!existing.has(name)) {
+      db.prepare(`ALTER TABLE runs ADD COLUMN ${ddl}`).run();
+    }
+  }
+}
 
 // ---------- 读取 ----------
 
@@ -548,8 +597,10 @@ export function insertRun(db, b) {
          frozen_verification_passed, frozen_verification_diff_sum,
          frozen_verification_mass_sum, frozen_verification_checks_json,
          frozen_reservation_start_utc, frozen_reservation_end_utc,
-         frozen_reservation_usage_json
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         frozen_reservation_usage_json,
+         frozen_calibration_id, frozen_calibration_no, frozen_calibration_passed,
+         frozen_calibration_calibrated_at, frozen_calibration_expires_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       b.runNo,
@@ -571,6 +622,15 @@ export function insertRun(db, b) {
       b.reservationStartUtc,
       b.reservationEndUtc,
       JSON.stringify(b.reservationUsage ?? []),
+      b.calibrationId ?? null,
+      b.calibrationNo ?? null,
+      b.calibrationPassed === undefined || b.calibrationPassed === null
+        ? null
+        : b.calibrationPassed
+          ? 1
+          : 0,
+      b.calibrationCalibratedAt ?? null,
+      b.calibrationExpiresAt ?? null,
     );
   return getRunRow(db, info.lastInsertRowid);
 }
@@ -661,4 +721,54 @@ export function insertMaintenance(db, { maintNo, deviceNo, reason, createdAt }) 
     )
     .run(maintNo, deviceNo, reason, createdAt);
   return getMaintenanceRow(db, info.lastInsertRowid);
+}
+
+// ---------- 设备校准（只追加；由 server 在单事务内调用） ----------
+
+export function getCalibrationRow(db, id) {
+  return db.prepare('SELECT * FROM calibrations WHERE id = ?').get(id);
+}
+
+export function getCalibrationRowByNo(db, calibNo) {
+  return db.prepare('SELECT * FROM calibrations WHERE calib_no = ?').get(calibNo);
+}
+
+// 全部校准记录（列表：最新在前）
+export function listCalibrationRows(db) {
+  return db
+    .prepare('SELECT * FROM calibrations ORDER BY calibrated_at DESC, id DESC')
+    .all();
+}
+
+// 指定设备的校准记录（最新在前）；deviceNo 省略时取全部设备。
+export function listCalibrationRowsByDevice(db, deviceNo) {
+  return db
+    .prepare(
+      `SELECT * FROM calibrations
+        WHERE device_no = ?
+        ORDER BY calibrated_at DESC, id DESC`,
+    )
+    .all(deviceNo);
+}
+
+// 指定设备最新一条校准记录（按校准时间，再以 id 决胜）；无记录返回 undefined。
+export function getLatestCalibrationRow(db, deviceNo) {
+  return db
+    .prepare(
+      `SELECT * FROM calibrations
+        WHERE device_no = ?
+        ORDER BY calibrated_at DESC, id DESC LIMIT 1`,
+    )
+    .get(deviceNo);
+}
+
+// 追加校准记录（登记校验由 server 在同事务内完成）。
+export function insertCalibration(db, { calibNo, deviceNo, calibratedAt, expiresAt, passed }) {
+  const info = db
+    .prepare(
+      `INSERT INTO calibrations (calib_no, device_no, calibrated_at, expires_at, passed)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(calibNo, deviceNo, calibratedAt, expiresAt, passed ? 1 : 0);
+  return getCalibrationRow(db, info.lastInsertRowid);
 }

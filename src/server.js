@@ -50,6 +50,12 @@ import {
   listMaintenanceRows,
   getLatestMaintenanceRow,
   insertMaintenance,
+  getCalibrationRow,
+  getCalibrationRowByNo,
+  listCalibrationRows,
+  listCalibrationRowsByDevice,
+  getLatestCalibrationRow,
+  insertCalibration,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -73,6 +79,12 @@ import {
   normalizeMaintenanceInput,
   summarizeDevice,
 } from './maintenance.js';
+import {
+  normalizeCalibrationInput,
+  isCalibrationInPast,
+  isLaterThanPrevious,
+  checkCalibrationForRun,
+} from './calibration.js';
 import {
   ValidationError,
   ConflictError,
@@ -119,6 +131,7 @@ export function createApp(db) {
       runs: listRunRows(db).map((r) => runView(r, hash, Date.now())),
       devices: listDeviceViews(db),
       maintenances: listMaintenanceRows(db).map(maintenanceView),
+      calibrations: listCalibrationRows(db).map((r) => calibrationView(r, Date.now())),
     });
   });
 
@@ -1044,10 +1057,12 @@ export function createApp(db) {
   //   5. 该预约未被其他运行使用（一个预约至多一次运行）；
   //   6. 同设备无进行中运行；
   //   7. 设备保养额度：设置了上限的设备，本累计周期已完结运行累计时长达到
-  //      上限即拒绝（未设置上限的设备不核对，沿用原行为）。
-  // 任一冲突即 409 回滚，不留记录。开始后冻结发布图（编号/指纹/快照）、核验结论
-  // 与预约时段。完结填写 completed/aborted，结束时间须晚于开始；超过预约终点仍如实
-  // 完结并标记 timedOut，随即释放设备（部分唯一索引）；不改写预约。
+  //      上限即拒绝（未设置上限的设备不核对，沿用原行为）；
+  //   8. 设备校准：已有校准记录的设备，其最新一条结论须合格且到期时间不早于
+  //      本次预约终点（到期恰等于终点视为足够）；无校准记录的设备沿用原规则。
+  // 任一冲突即 409 回滚，不留记录。开始后冻结发布图（编号/指纹/快照）、核验结论、
+  // 预约时段与校准依据。完结填写 completed/aborted，结束时间须晚于开始；超过预约
+  // 终点仍如实完结并标记 timedOut，随即释放设备（部分唯一索引）；不改写预约。
   // 相同运行编号同开始内容重复提交返回原记录（200），异内容拒绝（409）；
   // 完结同状态重复提交返回原结果（200），异状态拒绝（409）。
   // 后续配置、库存或预约状态变化（含取消）均不改写已冻结的运行历史。
@@ -1103,6 +1118,18 @@ export function createApp(db) {
           endUtc: row.frozen_reservation_end_utc,
           usage: JSON.parse(row.frozen_reservation_usage_json),
         },
+        // 冻结的校准依据（开始时该设备最新一条校准记录；null 表示当时无记录，
+        // 无记录设备沿用原开始规则）。开始后新增校准记录不改写此处。
+        calibration:
+          row.frozen_calibration_id == null
+            ? null
+            : {
+                id: row.frozen_calibration_id,
+                calibNo: row.frozen_calibration_no,
+                passed: !!row.frozen_calibration_passed,
+                calibratedAt: row.frozen_calibration_calibrated_at,
+                expiresAt: row.frozen_calibration_expires_at,
+              },
         // 展示用：预约当前状态快照（active/cancelled）；预约被取消不改写运行历史
         reservationCurrentStatus: null,
       },
@@ -1246,6 +1273,44 @@ export function createApp(db) {
           }
         }
 
+        // 8. 设备校准：按该设备最新一条校准记录判定——结论须合格，且到期时间不早于
+        //    本次预约终点（到期恰等于终点视为有效期足够）；无校准记录的设备沿用原
+        //    开始规则。通过后校准依据随运行冻结；既有运行编号的幂等重放在上方已先行
+        //    返回，不受之后新增/失效校准记录影响。
+        const latestCalib = getLatestCalibrationRow(db, deviceNo);
+        if (latestCalib) {
+          const verdict = checkCalibrationForRun(
+            { passed: !!latestCalib.passed, expiresUtc: latestCalib.expires_at },
+            endMs,
+          );
+          const calibDetail = {
+            id: latestCalib.id,
+            calibNo: latestCalib.calib_no,
+            calibratedAt: latestCalib.calibrated_at,
+            expiresAt: latestCalib.expires_at,
+            passed: !!latestCalib.passed,
+          };
+          if (verdict.reason === 'failed') {
+            throw new ConflictError(
+              [
+                `设备「${deviceNo}」最新校准记录 #${latestCalib.id}（校准单号「${latestCalib.calib_no}」）` +
+                  '结论为不合格，不能放行运行；请重新校准合格后再开始',
+              ],
+              { detail: { calibration: calibDetail, reason: 'failed' } },
+            );
+          }
+          if (verdict.reason === 'expired') {
+            throw new ConflictError(
+              [
+                `设备「${deviceNo}」最新校准记录 #${latestCalib.id}（校准单号「${latestCalib.calib_no}」）` +
+                  `有效期至 ${latestCalib.expires_at}，早于本次预约终点 ${resRow.end_utc}，` +
+                  '校准有效期不足，不能放行运行；请重新校准使其覆盖预约终点后再开始',
+              ],
+              { detail: { calibration: calibDetail, reason: 'expired' } },
+            );
+          }
+        }
+
         const row = insertRun(db, {
           runNo,
           deviceNo,
@@ -1264,6 +1329,11 @@ export function createApp(db) {
           reservationStartUtc: resRow.start_utc,
           reservationEndUtc: resRow.end_utc,
           reservationUsage: JSON.parse(resRow.usage_json),
+          calibrationId: latestCalib ? latestCalib.id : null,
+          calibrationNo: latestCalib ? latestCalib.calib_no : null,
+          calibrationPassed: latestCalib ? !!latestCalib.passed : null,
+          calibrationCalibratedAt: latestCalib ? latestCalib.calibrated_at : null,
+          calibrationExpiresAt: latestCalib ? latestCalib.expires_at : null,
         });
         view = runView(row, hash, nowMs);
       });
@@ -1371,6 +1441,11 @@ export function createApp(db) {
       runs: runs.map((r) => ({ startUtc: r.start_utc, endedAt: r.ended_at })),
       lastMaintenanceAt: lastMaint ? lastMaint.created_at : null,
     });
+    const latestCalibRow = getLatestCalibrationRow(dbArg, deviceNo);
+    const nowMs = Date.now();
+    const latestCalibration = latestCalibRow
+      ? calibrationView(latestCalibRow, nowMs)
+      : null;
     return {
       ...summary,
       running: !!active,
@@ -1380,10 +1455,16 @@ export function createApp(db) {
         .prepare('SELECT COUNT(*) AS c FROM maintenances WHERE device_no = ?')
         .get(deviceNo).c,
       lastMaintenanceAt: lastMaint ? lastMaint.created_at : null,
+      // 该设备最新一条校准记录（无记录为 null）；calibrationValidNow 仅展示用，
+      // 开始运行时按「到期不早于预约终点」在事务内重新判定。
+      latestCalibration,
+      calibrationCount: dbArg
+        .prepare('SELECT COUNT(*) AS c FROM calibrations WHERE device_no = ?')
+        .get(deviceNo).c,
     };
   }
 
-  // 已知设备 = 出现过运行、设置过上限或登记过保养的设备编号并集
+  // 已知设备 = 出现过运行、设置过上限、登记过保养或有校准记录的设备编号并集
   function listDeviceViews(dbArg) {
     const deviceNos = new Set();
     for (const r of dbArg.prepare('SELECT DISTINCT device_no FROM runs').all()) {
@@ -1391,12 +1472,14 @@ export function createApp(db) {
     }
     for (const r of listDeviceLimitRows(dbArg)) deviceNos.add(r.device_no);
     for (const m of listMaintenanceRows(dbArg)) deviceNos.add(m.device_no);
+    for (const c of listCalibrationRows(dbArg)) deviceNos.add(c.device_no);
     return [...deviceNos].sort().map((d) => deviceView(dbArg, d));
   }
 
   function deviceKnown(dbArg, deviceNo) {
     if (getDeviceLimitRow(dbArg, deviceNo)) return true;
     if (getLatestMaintenanceRow(dbArg, deviceNo)) return true;
+    if (getLatestCalibrationRow(dbArg, deviceNo)) return true;
     return !!dbArg
       .prepare('SELECT 1 FROM runs WHERE device_no = ? LIMIT 1')
       .get(deviceNo);
@@ -1419,7 +1502,7 @@ export function createApp(db) {
   app.get('/api/devices/:deviceNo', (req, res) => {
     const deviceNo = String(req.params.deviceNo || '').trim();
     if (!deviceKnown(db, deviceNo)) {
-      return res.status(404).json({ error: '设备不存在（无运行、上限或保养记录）' });
+      return res.status(404).json({ error: '设备不存在（无运行、上限、保养或校准记录）' });
     }
     res.json(deviceView(db, deviceNo));
   });
@@ -1509,6 +1592,126 @@ export function createApp(db) {
     const row = getMaintenanceRow(db, Number(req.params.id));
     if (!row) return res.status(404).json({ error: '保养记录不存在' });
     res.json(maintenanceView(row));
+  });
+
+  // ---------- 设备校准 ----------
+  //
+  // 实验室按设备校准记录决定运行能否放行：
+  //   - 登记（只追加）：唯一校准单号 + 设备编号 + 校准时间 + 到期时间 + 合格/不合格；
+  //     时间为 UTC，校准时间须早于到期时间且不得晚于服务端当前时刻，同设备校准时间
+  //     须晚于上一条；
+  //   - 同号同内容重复提交返回原记录（200），同号异内容拒绝（409）；
+  //   - 无效输入不留校准记录（400）；同设备校准时间不晚于上一条为 409（不留记录）；
+  //   - 开始运行时按设备最新一条校准记录在原事务内判定：结论合格且到期不早于本次
+  //     预约终点方可放行；无校准记录的设备沿用原开始规则；
+  //   - 开始成功即冻结校准依据；之后新增记录、运行超时或完结不改写历史。
+
+  function calibrationView(row, nowMs) {
+    const expiresMs = Date.parse(row.expires_at);
+    return {
+      id: row.id,
+      calibNo: row.calib_no,
+      deviceNo: row.device_no,
+      calibratedAt: row.calibrated_at,
+      expiresAt: row.expires_at,
+      passed: !!row.passed,
+      createdAt: row.created_at,
+      // 展示用阶段：合格且到期时间晚于当前时刻为 valid；
+      // 不合格为 failed；已到期（到期不晚于当前时刻）为 expired
+      phase: !row.passed ? 'failed' : nowMs < expiresMs ? 'valid' : 'expired',
+    };
+  }
+
+  // 登记校准：非法输入（空单号/设备、非法时间、校准不早于到期、结论非布尔、
+  // 校准时间晚于当前时刻）→ 400；同设备校准时间不晚于上一条 → 409；
+  // 同号异内容 → 409。任何失败均回滚，不留校准记录。
+  app.post('/api/calibrations', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeCalibrationInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { calibNo, deviceNo, calibratedAt, expiresAt, calibratedAtMs, passed } = clean;
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：同校准单号——内容一致返回原记录，不一致拒绝
+        const existing = getCalibrationRowByNo(db, calibNo);
+        if (existing) {
+          const same =
+            existing.device_no === deviceNo &&
+            existing.calibrated_at === calibratedAt &&
+            existing.expires_at === expiresAt &&
+            !!existing.passed === passed;
+          if (!same) {
+            throw new ConflictError(
+              [`校准单号「${calibNo}」已被使用且校准内容不同，拒绝重复提交`],
+              { existingId: existing.id },
+            );
+          }
+          view = calibrationView(existing, Date.now());
+          status = 200;
+          return;
+        }
+
+        // 校准时间不得晚于服务端当前时刻（事务内取时，避免时钟偏移）
+        const nowMs = Date.now();
+        if (!isCalibrationInPast(calibratedAtMs, nowMs)) {
+          throw new ValidationError([
+            `校准时间 ${calibratedAt} 晚于服务端当前时刻 ${toIso(nowMs)}，不能登记未来的校准`,
+          ]);
+        }
+
+        // 同设备校准时间须晚于上一条（最新一条）校准记录
+        const previous = getLatestCalibrationRow(db, deviceNo);
+        if (previous && !isLaterThanPrevious(calibratedAtMs, Date.parse(previous.calibrated_at))) {
+          throw new ConflictError(
+            [
+              `设备「${deviceNo}」已有校准记录 #${previous.id}（校准单号「${previous.calib_no}」，` +
+                `校准时间 ${previous.calibrated_at}）：同设备新校准时间 ${calibratedAt} ` +
+                '必须晚于上一条校准记录的校准时间',
+            ],
+            { existingId: previous.id },
+          );
+        }
+
+        const row = insertCalibration(db, {
+          calibNo,
+          deviceNo,
+          calibratedAt,
+          expiresAt,
+          passed,
+        });
+        view = calibrationView(row, nowMs);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/calibrations', (req, res, next) => {
+    try {
+      const nowMs = Date.now();
+      if (req.query.deviceNo !== undefined) {
+        const dev = normalizeDeviceNo(req.query.deviceNo);
+        if (dev.errors.length) throw new ValidationError(dev.errors);
+        return res.json(
+          listCalibrationRowsByDevice(db, dev.clean.deviceNo).map((r) =>
+            calibrationView(r, nowMs),
+          ),
+        );
+      }
+      res.json(listCalibrationRows(db).map((r) => calibrationView(r, nowMs)));
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/calibrations/:id', (req, res) => {
+    const row = getCalibrationRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '校准记录不存在' });
+    res.json(calibrationView(row, Date.now()));
   });
 
   // ---------- 静态前端 ----------

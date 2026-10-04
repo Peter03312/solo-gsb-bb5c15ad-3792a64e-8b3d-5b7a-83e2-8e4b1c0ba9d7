@@ -208,9 +208,11 @@
         以<b>唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号</b>开始一次离心运行；
         开始/结束时间由服务端记录。开始时在事务内确认：核验已通过、核验与生效预约指向
         <b>同一张发布图</b>、发布图<b>当前可用</b>、当前时刻处于预约
-        <b>左闭右开 [开始, 结束)</b> 时段、该预约未被其他运行使用、同设备无进行中运行；
-        任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论与预约时段；完结如实填写
-        「完成 / 中止」，超过预约终点完结会标记<b>超时</b>，随即释放设备，不改写预约。
+        <b>左闭右开 [开始, 结束)</b> 时段、该预约未被其他运行使用、同设备无进行中运行、
+        保养额度未达上限；<b>已有校准记录的设备还须最新校准合格且到期不早于预约终点</b>
+        （无校准记录的设备沿用原规则）；
+        任一冲突即拒绝且不留记录。开始后冻结发布图、核验结论、预约时段与校准依据；完结如实填写
+        「完成 / 中止」，超过预约终点完结会标记<b>超时</b>，随即释放设备，不改写预约与校准依据。
         相同运行编号同内容重复提交返回原记录，异内容拒绝；完结同状态重放返回原结果。
       </div>
       <div class="form-row">
@@ -235,8 +237,46 @@
       <div id="run-list"></div>
     </section>
 
+    <section class="card" id="sec-calib">
+      <h2>12. 设备校准（放行依据）</h2>
+      <div class="muted" style="margin-bottom:10px">
+        实验室按设备校准记录决定运行能否放行。登记时填写<b>唯一校准单号、设备编号、
+        校准时间、到期时间与合格/不合格结论</b>（时间均为 UTC）：校准时间须早于到期时间、
+        不得晚于服务端当前时刻，同设备校准时间须晚于上一条。记录<b>只追加</b>，按
+        <b>最新一条</b>判定。已有校准记录的设备开始运行时，须最新结论<b>合格</b>且到期时间
+        <b>不早于本次预约终点</b>；无校准记录的设备沿用原开始规则。开始成功后冻结校准依据，
+        之后新增记录、运行超时或完结不改写历史。同号同内容重放返回原记录，异内容拒绝。
+      </div>
+      <div class="form-row">
+        <label>校准单号（唯一）
+          <input id="calib-no" type="text" placeholder="如 CAL-2026-001" />
+        </label>
+        <label>设备编号
+          <input id="calib-device" type="text" list="known-devices" placeholder="如 CENT-01" />
+        </label>
+        <label>校准时间（UTC）
+          <input id="calib-at" type="datetime-local" step="1" />
+        </label>
+        <label>到期时间（UTC）
+          <input id="calib-expires" type="datetime-local" step="1" />
+        </label>
+        <label>校准结论
+          <select id="calib-passed">
+            <option value="true">合格</option>
+            <option value="false">不合格</option>
+          </select>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="calib-submit" class="primary">登记校准记录</button>
+      </div>
+      <div id="calib-conflict"></div>
+      <h3>校准记录（按校准时间倒序，只追加）</h3>
+      <div id="calib-list"></div>
+    </section>
+
     <section class="card" id="sec-maint">
-      <h2>12. 设备保养（按累计运行时长）</h2>
+      <h2>13. 设备保养（按累计运行时长）</h2>
       <div class="muted" style="margin-bottom:10px">
         按设备编号设置<b>正整数秒数</b>的保养上限：系统统计<b>自最近一次保养后已完结运行</b>的
         累计时长（完成 / 中止均按服务端起止时间计入，进行中不提前计入；尚无保养记录时计入
